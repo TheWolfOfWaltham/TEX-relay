@@ -1,5 +1,12 @@
 const express = require('express');
-const { createCanvas } = require('@napi-rs/canvas');
+const { createCanvas, GlobalFonts } = require('@napi-rs/canvas');
+const path = require('path');
+
+// Register bundled fonts (Railway containers ship without system fonts)
+try {
+  GlobalFonts.registerFromPath(path.join(__dirname, 'DejaVuSans.ttf'), 'DejaVu Sans');
+  GlobalFonts.registerFromPath(path.join(__dirname, 'DejaVuSans-Bold.ttf'), 'DejaVu Sans');
+} catch (e) { console.error('font registration failed:', e); }
 
 const app = express();
 app.use(express.json({ limit: '64kb' }));
@@ -114,7 +121,7 @@ async function postToDiscord(d, png) {
     timestamp: new Date().toISOString(),
   };
   const form = new FormData();
-  form.append('payload_json', JSON.stringify({ username: 'TradeXWhisperer', embeds: [embed] }));
+  form.append('payload_json', JSON.stringify({ username: 'TEX-Entry', embeds: [embed] }));
   form.append('files[0]', new Blob([png], { type: 'image/png' }), 'dashboard.png');
   const res = await fetch(DISCORD_WEBHOOK_URL, { method: 'POST', body: form });
   if (!res.ok) throw new Error(`Discord ${res.status}: ${await res.text()}`);
