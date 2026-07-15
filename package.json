@@ -1,7 +1,7 @@
 {
   "name": "tradexwhisperer-discord-relay",
-  "version": "1.0.0",
-  "description": "TradingView webhook -> dashboard PNG -> Discord",
+  "version": "2.0.0",
+  "description": "TradingView webhook -> dashboard PNG -> Discord, plus !TICKER on-demand snapshot bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@napi-rs/canvas": "^0.1.53",
+    "discord.js": "^14.16.3",
     "express": "^4.19.2"
   }
 }
