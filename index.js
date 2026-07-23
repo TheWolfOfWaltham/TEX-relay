@@ -10,12 +10,21 @@ try {
 } catch (e) { console.error('font registration failed:', e); }
 
 const app = express();
-app.use(express.json({ limit: '64kb' }));
-app.use(express.text({ type: '*/*', limit: '64kb' }));
+// Parse ALL bodies as raw text and JSON.parse manually with NaN sanitation —
+// express.json() auto-400s on malformed JSON (e.g. Pine emitting NaN for
+// young tickers with insufficient history), killing the whole chunk.
+app.use(express.text({ type: '*/*', limit: '256kb' }));
 
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
+const DISCORD_WEBHOOK_URL_3M = process.env.DISCORD_WEBHOOK_URL_3M || '';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN || '';
+
+// 'D' → 1D; anything else is minutes ('3' → 3m)
+const tfLabel = tf => (!tf || tf === 'D' ? '1D' : `${tf}m`);
+const isDaily = d => !d.timeframe || d.timeframe === 'D';
+// Route: daily entries → main channel; intraday → scalp channel (falls back to main if unset)
+const webhookFor = d => (isDaily(d) ? DISCORD_WEBHOOK_URL : (DISCORD_WEBHOOK_URL_3M || DISCORD_WEBHOOK_URL));
 
 // ── Snapshot cache ─────────────────────────────────────────────────────────
 // ticker → { data: <same payload shape as an entry>, received_at: ISO string }
@@ -90,7 +99,7 @@ function renderDashboard(d) {
   ctx.fillStyle = C.white;
   ctx.font = 'bold 15px "DejaVu Sans", sans-serif';
   ctx.textAlign = 'left';
-  ctx.fillText(`${d.exchange ? d.exchange + ':' : ''}${d.ticker || ''} · 1D`, 10, RH / 2);
+  ctx.fillText(`${d.exchange ? d.exchange + ':' : ''}${d.ticker || ''} · ${tfLabel(d.timeframe)}`, 10, RH / 2);
   ctx.fillStyle = C.gray;
   ctx.font = '14px "DejaVu Sans", sans-serif';
   ctx.textAlign = 'right';
@@ -160,12 +169,12 @@ function buildEmbed(d) {
   const ultra = d.signal === 'ULTRA';
   const entry = d.signal === 'ENTRY';
   return {
-    title: `${ultra ? '★ ULTRA' : entry ? '▲ ENTRY' : '━ SNAPSHOT'} — ${d.ticker}`,
+    title: `${ultra ? '★ ULTRA' : entry ? '▲ ENTRY' : '━ SNAPSHOT'} — ${d.ticker} [${tfLabel(d.timeframe)}]`,
     color: ultra ? 0x00ffff : entry ? 0x00bfff : 0x99aabb,
     description:
       `**Buy range:** \`${d.buy_low} – ${d.buy_high}\`\n` +
       `**Close:** \`${d.close}\`  •  **ATR14:** \`${d.atr14}\`\n` +
-      `**Daily bar:** ${d.bar_date}`,
+      `**Bar:** ${d.bar_date}`,
     image: { url: 'attachment://dashboard.png' },
     footer: { text: `TradeXWhisperer • ${d.exchange || ''}:${d.ticker}` },
     timestamp: new Date().toISOString(),
@@ -173,11 +182,42 @@ function buildEmbed(d) {
 }
 
 async function postToDiscord(d, png) {
+  const url = webhookFor(d);
+  const username = isDaily(d) ? 'TEX-Entry' : 'TEX-Scalp';
   const form = new FormData();
-  form.append('payload_json', JSON.stringify({ username: 'TEX-Entry', embeds: [buildEmbed(d)] }));
+  form.append('payload_json', JSON.stringify({ username, embeds: [buildEmbed(d)] }));
   form.append('files[0]', new Blob([png], { type: 'image/png' }), 'dashboard.png');
-  const res = await fetch(DISCORD_WEBHOOK_URL, { method: 'POST', body: form });
+  const res = await fetch(url, { method: 'POST', body: form });
   if (!res.ok) throw new Error(`Discord ${res.status}: ${await res.text()}`);
+}
+
+// ── Compact snapshot decoding (snap_v2) ────────────────────────────────────
+// Pine sends rows of positional arrays to fit ~20 tickers per alert, cutting
+// the burst at daily close from ~16 webhooks to ~4 (rate-limit safe).
+const DIR = { u: 'up', d: 'down', f: 'flat' };
+const DSTATE = { B: 'BULL ^', X: 'BEAR v', '-': '--' };
+const HSTATE = { 'P^': 'POS ^', 'Pv': 'POS v', 'N^': 'NEG ^', 'Nv': 'NEG v' };
+const fibZone = p => p < 0 ? '< 0%' : p < 23.6 ? '0-23.6%' : p < 38.2 ? '23.6-38.2%' : p < 50 ? '38.2-50%' : p < 61.8 ? '50-61.8%' : p < 78.6 ? '61.8-78.6%' : p < 100 ? '78.6-100%' : '> 100%';
+
+function expandRow(r, tf, barDate) {
+  if (!Array.isArray(r) || r.length < 23) return null;
+  const [ticker, exchange, sig, close, buyLo, atr14, r6, d6, r14, d14, r24, d24,
+         k, dk, dV, dSt, m, dm, h, hSt, vdk, vSt, fibP] = r;
+  if (close == null || ticker == null) return null;
+  return {
+    ticker, exchange: exchange || '', timeframe: tf, bar_date: barDate,
+    signal: sig === 2 ? 'ULTRA' : sig === 1 ? 'ENTRY' : 'NONE',
+    close, buy_low: buyLo, buy_high: close, atr14,
+    rsi6: r6, rsi6_dir: DIR[d6] || 'flat',
+    rsi14: r14, rsi14_dir: DIR[d14] || 'flat',
+    rsi24: r24, rsi24_dir: DIR[d24] || 'flat',
+    stoch_k: k, stoch_k_dir: DIR[dk] || 'flat',
+    stoch_d: dV, stoch_d_state: DSTATE[dSt] || '--',
+    macd_line: m, macd_dir: DIR[dm] || 'flat',
+    macd_hist: h, macd_hist_state: HSTATE[hSt] || 'NEG ^',
+    vol_delta_k: vdk, vol_state: vSt ? 'BUY PRES' : 'SELL PRES',
+    fib_pct: fibP, fib_zone: fibZone(Number(fibP)),
+  };
 }
 
 // ── HTTP endpoints ─────────────────────────────────────────────────────────
@@ -192,14 +232,28 @@ app.get('/snapshots', (_req, res) => {
 
 app.post('/webhook', async (req, res) => {
   try {
-    const d = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    const raw = typeof req.body === 'string' ? req.body : JSON.stringify(req.body || {});
+    // NaN (from Pine tickers with insufficient history) is invalid JSON — neutralize it
+    const d = JSON.parse(raw.replace(/\bNaN\b/g, 'null'));
     if (WEBHOOK_SECRET && d.secret !== WEBHOOK_SECRET) {
       return res.status(401).send('bad secret');
     }
 
-    // Daily all-ticker snapshot batches: cache only, no Discord post
+    // Compact daily snapshot batches (v2 format): cache only, no Discord post
+    if (d.event === 'snap_v2' && Array.isArray(d.rows)) {
+      let n = 0;
+      for (const r of d.rows) {
+        const s = expandRow(r, d.tf || 'D', d.bar_date || '');
+        if (s && isDaily(s)) { cacheSnapshot(s); n++; }
+      }
+      persistCache();
+      console.log(`Cached ${n}/${d.rows.length} snapshots (snap_v2, ${d.bar_date || '?'})`);
+      return res.status(200).send('cached');
+    }
+
+    // Legacy verbose snapshot batches: cache only, no Discord post
     if (d.event === 'snapshot_batch' && Array.isArray(d.snapshots)) {
-      for (const s of d.snapshots) cacheSnapshot(s);
+      for (const s of d.snapshots) if (isDaily(s)) cacheSnapshot(s); // !TICKER bot is daily-only
       persistCache();
       console.log(`Cached ${d.snapshots.length} snapshots (${d.snapshots.map(s => s.ticker).join(', ')})`);
       return res.status(200).send('cached');
@@ -211,9 +265,9 @@ app.post('/webhook', async (req, res) => {
       : null;
     if (!entries || entries.length === 0) return res.status(200).send('ignored');
     for (const e of entries) {
-      cacheSnapshot(e); // entries also refresh the on-demand cache
+      if (isDaily(e)) cacheSnapshot(e); // daily entries also refresh the on-demand cache
       const png = renderDashboard(e);
-      if (!DISCORD_WEBHOOK_URL) {
+      if (!webhookFor(e)) {
         const out = `/tmp/dashboard_${e.ticker || 'unknown'}.png`;
         fs.writeFileSync(out, png);
         console.log(`DRY RUN — PNG saved to ${out}`);
